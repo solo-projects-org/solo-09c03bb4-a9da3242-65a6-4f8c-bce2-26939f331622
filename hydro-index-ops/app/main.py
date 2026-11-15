@@ -17,6 +17,7 @@ from psycopg_pool import AsyncConnectionPool
 
 from . import db
 from . import sql_helpers as sql
+from .baselines import router as baselines_router
 from .config import settings
 from .db import close_pool, init_pool
 from .models import BatchCreate, BatchOut, LongTxOut, ReadingIn, ReadingOut
@@ -56,18 +57,25 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="水文数仓 · 水位明细索引运维 API",
-    version="1.0.0",
+    version="1.1.0",
     description=(
         "在 PostgreSQL `readings(station_id, observed_at)` 上以 "
-        "**CREATE INDEX CONCURRENTLY** 构建普通复合索引的批次化运维服务。\n\n"
+        "**CREATE INDEX CONCURRENTLY** 构建普通复合索引的批次化运维服务，"
+        "并提供水位明细的**质控基线冻结/核验**能力。\n\n"
+        "索引批次：\n"
         "- 同一时刻只受理一个批次，可查询构建阶段与错误、可取消；\n"
         "- 取消或失败必须等构建会话结束、索引残件删净才进入终态并接收新批；\n"
         "- 清理失败保留待处理状态并自动重试，期间源表普通读写照常；\n"
         "- 批次状态持久化，重启后先停遗留构建、清残件再接新批；\n"
-        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话。"
+        "- 只管理固定名称索引与自有构建会话，不删人工索引、不断其他会话。\n\n"
+        "质控基线：\n"
+        "- `POST /baselines` 按基线号+站号+UTC 起止原子冻结当时已提交的快照；\n"
+        "- 同号同站同范围重试幂等返回首次完整基线，参数变化 409；\n"
+        "- `GET /baselines/{no}/verify` 在同一已提交快照内列出被改写/消失/新增的记录。"
     ),
     lifespan=lifespan,
 )
+app.include_router(baselines_router)
 
 
 def get_pool() -> AsyncConnectionPool:

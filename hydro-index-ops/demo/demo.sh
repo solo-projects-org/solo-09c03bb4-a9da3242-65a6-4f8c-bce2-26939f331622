@@ -8,17 +8,19 @@
 #           （取消后的迟到完成不会留索引/报成功）
 #   场景 3  清理失败自动重试（HYDRO_CLEANUP_FAIL_FIRST 注入）
 #   场景 4  API 重启恢复：停遗留构建、清残件；成功索引与人工索引保留
+#   场景 5  质控基线：双实例冻结/幂等/冲突 → 模拟误改误删 → 核验三分类
 #
 # 用法：
 #   ./demo/demo.sh up        # 构建并启动 compose（首次）
-#   ./demo/demo.sh all       # 依次跑场景 1~4（默认）
-#   ./demo/demo.sh 1|2|3|4   # 只跑单个场景
+#   ./demo/demo.sh all       # 依次跑场景 1~5（默认）
+#   ./demo/demo.sh 1|2|3|4|5 # 只跑单个场景
 #
 # 依赖：docker compose、curl、jq（缺失 jq 时脚本自动降级为 python3 -m json.tool）
 # =============================================================================
 set -euo pipefail
 
 BASE="${BASE:-http://localhost:8000}"
+BASE2="${BASE2:-http://localhost:8001}"
 IDX="idx_readings_station_observed"
 PSQL=(docker exec -i hydro-db psql -U hydro -d hydro_warehouse -tA)
 
@@ -54,6 +56,15 @@ req() { # method path [data]
     curl -fsS -X "$m" "$BASE$p" -H 'Content-Type: application/json' -d "$d"
   else
     curl -fsS -X "$m" "$BASE$p"
+  fi
+}
+
+req2() { # 同 req，但打第二个实例
+  local m="$1" p="$2" d="${3:-}"
+  if [[ -n "$d" ]]; then
+    curl -fsS -X "$m" "$BASE2$p" -H 'Content-Type: application/json' -d "$d"
+  else
+    curl -fsS -X "$m" "$BASE2$p"
   fi
 }
 
@@ -276,6 +287,55 @@ scenario4() {
   ok "管理索引 valid、人工索引 idx_readings_ingested_manual 完好"
 }
 
+# --------------------------------------------------------------------------- #
+scenario5() {
+  c "场景 5：质控基线——双实例冻结/幂等/冲突 → 模拟误改误删 → 核验三分类"
+  for i in $(seq 1 30); do
+    curl -fsS "$BASE2/health" >/dev/null 2>&1 && break
+    sleep 2
+  done
+  local NO="DEMO-BL-$(date +%Y%m%d%H%M%S)"
+  # 以当前时刻为窗口右端，覆盖最近 24 小时的 1 号站数据
+  local end start
+  end=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  start=$(date -u -d '24 hours ago' +%Y-%m-%dT%H:%M:%SZ)
+  ok "基线号 $NO，窗口 [$start, $end]（UTC）"
+
+  c "5.1 实例1 冻结基线（201，item_count 为该窗口当前已提交条数）"
+  req POST /baselines "{\"baseline_no\":\"$NO\",\"station_id\":1,\"start\":\"$start\",\"end\":\"$end\"}" \
+    | python3 -m json.tool
+
+  c "5.2 窗口内补一条观测后，实例2 同号同参重试 → 200 幂等、不重采样"
+  req POST /readings "{\"station_id\":1,\"observed_at\":\"$end\",\"water_level\":23.01}" \
+    | jqr '"补录迟到记录 id=\(.id)"'
+  req2 POST /baselines "{\"baseline_no\":\"$NO\",\"station_id\":1,\"start\":\"$start\",\"end\":\"$end\"}" \
+    | python3 -m json.tool
+
+  c "5.3 同号不同参数 → 409 冲突"
+  if req2 POST /baselines "{\"baseline_no\":\"$NO\",\"station_id\":1,\"start\":\"$start\",\"end\":\"2027-01-01T00:00:00Z\"}" 2>/dev/null; then
+    die "参数变化应报 409"
+  else
+    ok "参数变化被 409 拒绝"
+  fi
+
+  c "5.4 通过 SQL 模拟误改/误删/迟到补录"
+  local ids id1 id2 id3
+  ids=$(req GET "/baselines/$NO/items?limit=3" | python3 -c \
+    'import sys,json; print(" ".join(str(i["reading_id"]) for i in json.load(sys.stdin)))')
+  read -r id1 id2 id3 <<<"$ids"
+  [[ -n "${id1:-}" && -n "${id2:-}" && -n "${id3:-}" ]] || die "窗口内明细不足 3 条，无法演示"
+  "${PSQL[@]}" -c "UPDATE readings SET water_level = water_level + 1.5 WHERE id = $id1" >/dev/null
+  ok "误改水位 id=$id1"
+  "${PSQL[@]}" -c "UPDATE readings SET observed_at = observed_at + interval '40 days' WHERE id = $id2" >/dev/null
+  ok "误改观测时刻到时间段外 id=$id2（仍应算改写）"
+  "${PSQL[@]}" -c "DELETE FROM readings WHERE id = $id3" >/dev/null
+  ok "误删 id=$id3"
+
+  c "5.5 实例2 核验：同一已提交快照内列出 改写/消失/新增"
+  req2 GET "/baselines/$NO/verify" | python3 -m json.tool
+  ok "改写含 $id1,$id2；消失含 $id3；新增含 5.2 的迟到记录"
+}
+
 main() {
   local what="${1:-all}"
   case "$what" in
@@ -284,15 +344,17 @@ main() {
     2) wait_health; scenario2 ;;
     3) wait_health; scenario3 ;;
     4) wait_health; scenario4 ;;
+    5) wait_health; scenario5 ;;
     all)
       up
       scenario1
       scenario2
       scenario3
       scenario4
+      scenario5
       c "全部场景演示完成"
       ;;
-    *) die "用法: $0 [up|all|1|2|3|4]" ;;
+    *) die "用法: $0 [up|all|1|2|3|4|5]" ;;
   esac
 }
 main "$@"

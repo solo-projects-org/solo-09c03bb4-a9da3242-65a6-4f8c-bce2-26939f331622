@@ -44,6 +44,36 @@ CREATE UNIQUE INDEX IF NOT EXISTS uq_batch_one_active
     WHERE state IN ('PENDING', 'BUILDING', 'CANCELLING', 'CLEANING');
 """
 
+# 质控基线：
+#   reading_baselines       基线头（baseline_no 全局唯一；提交后不可变）
+#   reading_baseline_items  基线明细（冻结时刻已提交的 readings 快照）
+# 头行与明细在同一个事务内写入：对外要么没有该基线、要么是完整基线，
+# 绝不会发布“半份基线”；明细不带指向 readings 的外键——原记录日后可能被
+# 删除，这正是核验要发现的“消失”。
+DDL_BASELINE_TABLES = """
+CREATE TABLE IF NOT EXISTS reading_baselines (
+    baseline_no  TEXT PRIMARY KEY,
+    station_id   BIGINT NOT NULL,
+    range_start  TIMESTAMPTZ NOT NULL,
+    range_end    TIMESTAMPTZ NOT NULL,
+    item_count   INTEGER NOT NULL,
+    frozen_at    TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CONSTRAINT chk_baseline_range CHECK (range_start < range_end)
+);
+
+CREATE TABLE IF NOT EXISTS reading_baseline_items (
+    baseline_no TEXT NOT NULL REFERENCES reading_baselines (baseline_no)
+                ON DELETE CASCADE,
+    reading_id  BIGINT NOT NULL,          -- 冻结时刻 readings.id
+    station_id  BIGINT NOT NULL,
+    observed_at TIMESTAMPTZ NOT NULL,
+    water_level NUMERIC(8, 3) NOT NULL,
+    discharge   NUMERIC(12, 3),
+    quality     TEXT NOT NULL,
+    CONSTRAINT pk_baseline_items PRIMARY KEY (baseline_no, reading_id)
+);
+"""
+
 
 async def init_pool() -> AsyncConnectionPool:
     global pool
@@ -57,9 +87,15 @@ async def init_pool() -> AsyncConnectionPool:
     )
     await pool.open()
     async with pool.connection() as conn:
-        await conn.execute(DDL_BATCH_TABLE)
+        # 多实例同时启动时串行化建表，避免并发 CREATE IF NOT EXISTS 竞态
+        await conn.execute("SELECT pg_advisory_lock(982451655)")
+        try:
+            await conn.execute(DDL_BATCH_TABLE)
+            await conn.execute(DDL_BASELINE_TABLES)
+        finally:
+            await conn.execute("SELECT pg_advisory_unlock(982451655)")
         await conn.commit()
-    log.info("connection pool ready, batch table ensured")
+    log.info("connection pool ready, batch/baseline tables ensured")
     return pool
 
 

@@ -39,5 +39,23 @@ services:
     ports:
       - "8000:8000"
 
+  # 第二个 API 实例：验证多实例并发下基线冻结/核验与水位写入的一致性。
+  # 索引构建由 worker 咨询锁保证全局只有一个实例驱动；基线靠数据库约束与
+  # 事务保证，任意实例都可安全受理。
+  api2:
+    build: .
+    container_name: hydro-api2
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      HYDRO_PG_DSN: postgresql://hydro:hydro_pw@db:5432/hydro_warehouse
+      HYDRO_WORK_POLL_INTERVAL: "1.0"
+      HYDRO_CLEANUP_RETRY_INTERVAL: "3.0"
+      HYDRO_CLEANUP_FAIL_FIRST: "0"
+      HYDRO_LOG_LEVEL: INFO
+    ports:
+      - "8001:8000"
+
 volumes:
   pgdata:
